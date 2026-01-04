@@ -1,3 +1,4 @@
+use crate::bottom_pane::textarea::TextAreaMode;
 #[cfg(target_os = "linux")]
 use crate::clipboard_paste::is_probably_wsl;
 use crate::key_hint;
@@ -22,6 +23,7 @@ pub(crate) struct FooterProps {
     pub(crate) is_task_running: bool,
     pub(crate) context_window_percent: Option<i64>,
     pub(crate) context_window_used_tokens: Option<i64>,
+    pub(crate) vim_mode: Option<TextAreaMode>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,6 +96,7 @@ fn footer_lines(props: FooterProps) -> Vec<Line<'static>> {
                 key_hint::plain(KeyCode::Char('?')).into(),
                 " for shortcuts".dim(),
             ]);
+            push_vim_mode(&mut line, props.vim_mode);
             vec![line]
         }
         FooterMode::ShortcutOverlay => {
@@ -110,10 +113,21 @@ fn footer_lines(props: FooterProps) -> Vec<Line<'static>> {
             shortcut_overlay_lines(state)
         }
         FooterMode::EscHint => vec![esc_hint_line(props.esc_backtrack_hint)],
-        FooterMode::ContextOnly => vec![context_window_line(
-            props.context_window_percent,
-            props.context_window_used_tokens,
-        )],
+        FooterMode::ContextOnly => {
+            let mut line = context_window_line(
+                props.context_window_percent,
+                props.context_window_used_tokens,
+            );
+            push_vim_mode(&mut line, props.vim_mode);
+            vec![line]
+        }
+    }
+}
+
+fn push_vim_mode(line: &mut Line<'static>, mode: Option<TextAreaMode>) {
+    if let Some(mode) = mode {
+        line.push_span(" · ".dim());
+        line.push_span(format!("[Vim: {}]", mode.label()).dim());
     }
 }
 
@@ -453,6 +467,7 @@ mod tests {
                 is_task_running: false,
                 context_window_percent: None,
                 context_window_used_tokens: None,
+                vim_mode: None,
             },
         );
 
@@ -465,6 +480,7 @@ mod tests {
                 is_task_running: false,
                 context_window_percent: None,
                 context_window_used_tokens: None,
+                vim_mode: None,
             },
         );
 
@@ -477,6 +493,7 @@ mod tests {
                 is_task_running: false,
                 context_window_percent: None,
                 context_window_used_tokens: None,
+                vim_mode: None,
             },
         );
 
@@ -489,6 +506,7 @@ mod tests {
                 is_task_running: true,
                 context_window_percent: None,
                 context_window_used_tokens: None,
+                vim_mode: None,
             },
         );
 
@@ -501,6 +519,7 @@ mod tests {
                 is_task_running: false,
                 context_window_percent: None,
                 context_window_used_tokens: None,
+                vim_mode: None,
             },
         );
 
@@ -513,6 +532,7 @@ mod tests {
                 is_task_running: false,
                 context_window_percent: None,
                 context_window_used_tokens: None,
+                vim_mode: None,
             },
         );
 
@@ -525,6 +545,7 @@ mod tests {
                 is_task_running: true,
                 context_window_percent: Some(72),
                 context_window_used_tokens: None,
+                vim_mode: None,
             },
         );
 
@@ -537,6 +558,7 @@ mod tests {
                 is_task_running: false,
                 context_window_percent: None,
                 context_window_used_tokens: Some(123_456),
+                vim_mode: None,
             },
         );
     }
