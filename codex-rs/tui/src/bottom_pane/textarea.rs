@@ -42,10 +42,41 @@ struct WrapCache {
     lines: Vec<Range<usize>>,
 }
 
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum TextAreaMode {
+    #[default]
+    Insert,
+    Normal,
+}
+
+impl TextAreaMode {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            TextAreaMode::Insert => "INSERT",
+            TextAreaMode::Normal => "NORMAL",
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct TextAreaState {
     /// Index into wrapped lines of the first visible line.
     scroll: u16,
+    mode: TextAreaMode,
+}
+
+impl TextAreaState {
+    pub(crate) fn mode(self) -> TextAreaMode {
+        self.mode
+    }
+
+    pub(crate) fn enter_insert_mode(&mut self) {
+        self.mode = TextAreaMode::Insert;
+    }
+
+    pub(crate) fn enter_normal_mode(&mut self) {
+        self.mode = TextAreaMode::Normal;
+    }
 }
 
 impl TextArea {
@@ -1622,7 +1653,10 @@ mod tests {
         let area = Rect::new(2, 5, 20, 3);
         // Even if an absurd scroll is provided, when content fits the area the
         // effective scroll is 0 and the cursor position matches cursor_pos.
-        let bad_state = TextAreaState { scroll: 999 };
+        let bad_state = TextAreaState {
+            scroll: 999,
+            ..Default::default()
+        };
         let (x1, y1) = t.cursor_pos(area).unwrap();
         let (x2, y2) = t.cursor_pos_with_state(area, bad_state).unwrap();
         assert_eq!((x2, y2), (x1, y1));
@@ -1636,7 +1670,10 @@ mod tests {
         // Put cursor somewhere near the end so it's definitely below the first window.
         t.set_cursor(t.text().len().saturating_sub(2));
         let small_area = Rect::new(0, 0, wrap_width, 2);
-        let state = TextAreaState { scroll: 0 };
+        let state = TextAreaState {
+            scroll: 0,
+            ..Default::default()
+        };
         let (_x, y) = t.cursor_pos_with_state(small_area, state).unwrap();
         assert_eq!(y, small_area.y + small_area.height - 1);
 
@@ -1650,6 +1687,7 @@ mod tests {
         let area = Rect::new(0, 0, wrap_width, 3);
         let state = TextAreaState {
             scroll: lines.saturating_mul(2),
+            ..Default::default()
         };
         let (_x, y) = t.cursor_pos_with_state(area, state).unwrap();
         assert_eq!(y, area.y);

@@ -50,6 +50,7 @@ use codex_protocol::custom_prompts::PROMPTS_CMD_PREFIX;
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::textarea::TextArea;
+use crate::bottom_pane::textarea::TextAreaMode;
 use crate::bottom_pane::textarea::TextAreaState;
 use crate::clipboard_paste::normalize_pasted_path;
 use crate::clipboard_paste::pasted_image_format;
@@ -92,6 +93,11 @@ enum PromptSelectionAction {
     Submit { text: String },
 }
 
+enum VimAction {
+    NoChange,
+    TextChanged,
+}
+
 pub(crate) struct ChatComposer {
     textarea: TextArea,
     textarea_state: RefCell<TextAreaState>,
@@ -120,6 +126,7 @@ pub(crate) struct ChatComposer {
     context_window_used_tokens: Option<i64>,
     skills: Option<Vec<SkillMetadata>>,
     dismissed_skill_popup_token: Option<String>,
+    vim_mode_enabled: bool,
 }
 
 /// Popup state – at most one can be visible at any time.
@@ -168,6 +175,7 @@ impl ChatComposer {
             context_window_used_tokens: None,
             skills: None,
             dismissed_skill_popup_token: None,
+            vim_mode_enabled: false,
         };
         // Apply configuration via the setter to keep side-effects centralized.
         this.set_disable_paste_burst(disable_paste_burst);
@@ -1113,7 +1121,22 @@ impl ChatComposer {
         if self.handle_shortcut_overlay_key(&key_event) {
             return (InputResult::None, true);
         }
+        if key_event.kind == KeyEventKind::Press
+            && matches!(key_event.code, KeyCode::Char('v'))
+            && key_event.modifiers.contains(KeyModifiers::CONTROL)
+            && key_event.modifiers.contains(KeyModifiers::ALT)
+        {
+            self.vim_mode_enabled = !self.vim_mode_enabled;
+            self.textarea_state.borrow_mut().enter_insert_mode();
+            return (InputResult::None, true);
+        }
         if key_event.code == KeyCode::Esc {
+            if self.vim_mode_enabled {
+                let (result, handled) = self.handle_input_basic(key_event);
+                if handled {
+                    return (result, true);
+                }
+            }
             if self.is_empty() {
                 let next_mode = esc_hint_mode(self.footer_mode, self.is_task_running);
                 if next_mode != self.footer_mode {
@@ -1301,6 +1324,147 @@ impl ChatComposer {
         }
     }
 
+    fn handle_vim_mode_key(&mut self, input: &KeyEvent) -> Option<VimAction> {
+        if !self.vim_mode_enabled {
+            return None;
+        }
+
+        let mut state = self.textarea_state.borrow_mut();
+        match state.mode() {
+            TextAreaMode::Insert => {
+                if matches!(input.code, KeyCode::Esc) {
+                    state.enter_normal_mode();
+                    return Some(VimAction::NoChange);
+                }
+            }
+            TextAreaMode::Normal => {
+                if input.kind != KeyEventKind::Press {
+                    return Some(VimAction::NoChange);
+                }
+                match input.code {
+                    KeyCode::Esc => return Some(VimAction::NoChange),
+                    KeyCode::Char('i') => {
+                        state.enter_insert_mode();
+                        return Some(VimAction::NoChange);
+                    }
+                    KeyCode::Char('a') => {
+                        self.textarea.move_cursor_right();
+                        state.enter_insert_mode();
+                        return Some(VimAction::NoChange);
+                    }
+                    KeyCode::Char('A') => {
+                        self.textarea.move_cursor_to_end_of_line(false);
+                        state.enter_insert_mode();
+                        return Some(VimAction::NoChange);
+                    }
+                    KeyCode::Char('h') => {
+                        self.textarea.move_cursor_left();
+                        return Some(VimAction::NoChange);
+                    }
+                    KeyCode::Char('l') => {
+                        self.textarea.move_cursor_right();
+                        return Some(VimAction::NoChange);
+                    }
+                    KeyCode::Char('j') => {
+                        self.textarea.move_cursor_down();
+                        return Some(VimAction::NoChange);
+                    }
+                    KeyCode::Char('k') => {
+                        self.textarea.move_cursor_up();
+                        return Some(VimAction::NoChange);
+                    }
+                    KeyCode::Char('w') => {
+                        let pos = self.textarea.end_of_next_word();
+                        self.textarea.set_cursor(pos);
+                        return Some(VimAction::NoChange);
+                    }
+                    KeyCode::Char('b') => {
+                        let pos = self.textarea.beginning_of_previous_word();
+                        self.textarea.set_cursor(pos);
+                        return Some(VimAction::NoChange);
+                    }
+                    KeyCode::Char('0') => {
+                        self.textarea.move_cursor_to_beginning_of_line(false);
+                        return Some(VimAction::NoChange);
+                    }
+                    KeyCode::Char('$') => {
+                        self.textarea.move_cursor_to_end_of_line(false);
+                        return Some(VimAction::NoChange);
+                    }
+                    KeyCode::Char('x') => {
+                        self.textarea.delete_forward(1);
+                        drop(state);
+                        self.sync_popups();
+                        return Some(VimAction::TextChanged);
+                    }
+                    KeyCode::Char('o') => {
+                        self.textarea.move_cursor_to_end_of_line(false);
+                        self.textarea.insert_str("\n");
+                        state.enter_insert_mode();
+                        drop(state);
+                        self.sync_popups();
+                        return Some(VimAction::TextChanged);
+                    }
+                    _ => {
+                        if !has_ctrl_or_alt(input.modifiers)
+                            && matches!(input.code, KeyCode::Char(_))
+                        {
+                            return Some(VimAction::NoChange);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn after_text_edit(&mut self, input: KeyEvent) {
+        let text_after = self.textarea.text();
+
+        let crossterm::event::KeyEvent {
+            code, modifiers, ..
+        } = input;
+        match code {
+            KeyCode::Char(_) => {
+                let has_ctrl_or_alt = has_ctrl_or_alt(modifiers);
+                if has_ctrl_or_alt {
+                    self.paste_burst.clear_window_after_non_char();
+                }
+            }
+            KeyCode::Enter => {
+                // Keep burst window alive (supports blank lines in paste).
+            }
+            _ => {
+                // Other keys: clear burst window (buffer should have been flushed above if needed).
+                self.paste_burst.clear_window_after_non_char();
+            }
+        }
+
+        self.pending_pastes
+            .retain(|(placeholder, _)| text_after.contains(placeholder));
+
+        if !self.attached_images.is_empty() {
+            let mut needed: HashMap<String, usize> = HashMap::new();
+            for img in &self.attached_images {
+                needed
+                    .entry(img.placeholder.clone())
+                    .or_insert_with(|| text_after.matches(&img.placeholder).count());
+            }
+
+            let mut used: HashMap<String, usize> = HashMap::new();
+            let mut kept: Vec<AttachedImage> = Vec::with_capacity(self.attached_images.len());
+            for img in self.attached_images.drain(..) {
+                let total_needed = *needed.get(&img.placeholder).unwrap_or(&0);
+                let used_count = used.entry(img.placeholder.clone()).or_insert(0);
+                if *used_count < total_needed {
+                    kept.push(img);
+                    *used_count += 1;
+                }
+            }
+            self.attached_images = kept;
+        }
+    }
+
     fn handle_paste_burst_flush(&mut self, now: Instant) -> bool {
         match self.paste_burst.flush_if_due(now) {
             FlushResult::Paste(pasted) => {
@@ -1324,6 +1488,13 @@ impl ChatComposer {
         // elapsed since the last char, flush it before handling a new input.
         let now = Instant::now();
         self.handle_paste_burst_flush(now);
+
+        if let Some(action) = self.handle_vim_mode_key(&input) {
+            if matches!(action, VimAction::TextChanged) {
+                self.after_text_edit(input);
+            }
+            return (InputResult::None, true);
+        }
 
         if !matches!(input.code, KeyCode::Esc) {
             self.footer_mode = reset_mode_after_activity(self.footer_mode);
@@ -1406,54 +1577,7 @@ impl ChatComposer {
 
         // Normal input handling
         self.textarea.input(input);
-        let text_after = self.textarea.text();
-
-        // Update paste-burst heuristic for plain Char (no Ctrl/Alt) events.
-        let crossterm::event::KeyEvent {
-            code, modifiers, ..
-        } = input;
-        match code {
-            KeyCode::Char(_) => {
-                let has_ctrl_or_alt = has_ctrl_or_alt(modifiers);
-                if has_ctrl_or_alt {
-                    self.paste_burst.clear_window_after_non_char();
-                }
-            }
-            KeyCode::Enter => {
-                // Keep burst window alive (supports blank lines in paste).
-            }
-            _ => {
-                // Other keys: clear burst window (buffer should have been flushed above if needed).
-                self.paste_burst.clear_window_after_non_char();
-            }
-        }
-
-        // Check if any placeholders were removed and remove their corresponding pending pastes
-        self.pending_pastes
-            .retain(|(placeholder, _)| text_after.contains(placeholder));
-
-        // Keep attached images in proportion to how many matching placeholders exist in the text.
-        // This handles duplicate placeholders that share the same visible label.
-        if !self.attached_images.is_empty() {
-            let mut needed: HashMap<String, usize> = HashMap::new();
-            for img in &self.attached_images {
-                needed
-                    .entry(img.placeholder.clone())
-                    .or_insert_with(|| text_after.matches(&img.placeholder).count());
-            }
-
-            let mut used: HashMap<String, usize> = HashMap::new();
-            let mut kept: Vec<AttachedImage> = Vec::with_capacity(self.attached_images.len());
-            for img in self.attached_images.drain(..) {
-                let total_needed = *needed.get(&img.placeholder).unwrap_or(&0);
-                let used_count = used.entry(img.placeholder.clone()).or_insert(0);
-                if *used_count < total_needed {
-                    kept.push(img);
-                    *used_count += 1;
-                }
-            }
-            self.attached_images = kept;
-        }
+        self.after_text_edit(input);
 
         (InputResult::None, true)
     }
@@ -1621,6 +1745,9 @@ impl ChatComposer {
     }
 
     fn footer_props(&self) -> FooterProps {
+        let vim_mode = self
+            .vim_mode_enabled
+            .then(|| self.textarea_state.borrow().mode());
         FooterProps {
             mode: self.footer_mode(),
             esc_backtrack_hint: self.esc_backtrack_hint,
@@ -1628,6 +1755,7 @@ impl ChatComposer {
             is_task_running: self.is_task_running,
             context_window_percent: self.context_window_percent,
             context_window_used_tokens: self.context_window_used_tokens,
+            vim_mode,
         }
     }
 
@@ -2039,6 +2167,7 @@ mod tests {
     use crate::bottom_pane::chat_composer::LARGE_PASTE_CHAR_THRESHOLD;
     use crate::bottom_pane::prompt_args::extract_positional_args_for_prompt_line;
     use crate::bottom_pane::textarea::TextArea;
+    use crate::bottom_pane::textarea::TextAreaMode;
     use tokio::sync::mpsc::unbounded_channel;
 
     #[test]
@@ -2122,6 +2251,67 @@ mod tests {
             .draw(|f| composer.render(f.area(), f.buffer_mut()))
             .unwrap();
         insta::assert_snapshot!(name, terminal.backend());
+    }
+
+    #[test]
+    fn vim_mode_toggles_and_switches_modes() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(true, sender, false, "placeholder".to_string(), false);
+
+        assert!(!composer.vim_mode_enabled);
+        assert_eq!(composer.footer_props().vim_mode, None);
+
+        let (_result, handled) = composer.handle_key_event(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+        assert!(handled);
+        assert!(composer.vim_mode_enabled);
+        assert_eq!(composer.footer_props().vim_mode, Some(TextAreaMode::Insert));
+
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(
+            composer.textarea_state.borrow().mode(),
+            TextAreaMode::Normal
+        );
+
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert_eq!(
+            composer.textarea_state.borrow().mode(),
+            TextAreaMode::Insert
+        );
+    }
+
+    #[test]
+    fn vim_normal_mode_handles_navigation_and_edits() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(true, sender, false, "placeholder".to_string(), false);
+        composer.textarea.set_text("hello world");
+
+        let _ = composer.handle_key_event(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(composer.current_text(), "ello world".to_string());
+
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert_eq!(composer.textarea.cursor(), 4);
+
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('$'), KeyModifiers::NONE));
+        assert_eq!(composer.textarea.cursor(), composer.textarea.text().len());
     }
 
     #[test]
